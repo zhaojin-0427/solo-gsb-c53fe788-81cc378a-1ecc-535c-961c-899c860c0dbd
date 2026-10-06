@@ -348,6 +348,16 @@ def report_result(conn, task_id, fingerprint, reads, artifact_digest):
     second time as a dynamic row (which would hit the primary key).  The
     dynamic set is replaced wholesale by the reads that are not static keys.
 
+    The accepted artifact and this run's input baseline (prev definition /
+    source hashes, per-dep read digests) are saved in the same transaction,
+    and the task is then re-adjudicated against its *new* dependency set
+    rather than forced reusable: a read that names an upstream which is
+    itself still executable or waiting makes this task (and, transitively,
+    downstream tasks whose inputs otherwise still match) wait for that
+    upstream.  Once the upstream finishes, the usual propagation restores
+    this task to reusable if the artifact digest is unchanged, or marks it
+    executable (downstream waiting) if it changed.
+
     Returns ``(status, detail)`` where status is "accepted", "stale" or one of
     the error codes.  Every failure rolls the whole report back, so tasks,
     deps, downstream verdicts and change sequence numbers are untouched.
@@ -438,16 +448,28 @@ def report_result(conn, task_id, fingerprint, reads, artifact_digest):
                 conn.rollback()
                 return "cycle", {"task_id": task_id}
 
-            # the task itself is now up to date with what it read
-            log = _ChangeLog(conn)
+            # ---- persist the accepted artifact + this run's input baseline -
             conn.execute(
                 "UPDATE tasks SET artifact_digest=?, prev_def_hash=def_hash, "
                 "                prev_source_digest=source_digest "
                 "WHERE task_id=?", (artifact_digest, task_id))
+
+            # ---- adjudicate against the *new* dependency set ----------------
+            # A freshly discovered upstream may itself still be executable or
+            # waiting; the reads just recorded are then provisional, so the
+            # task must wait for that upstream (and hold its downstream back)
+            # instead of turning reusable right away.  When every upstream is
+            # settled and matches what was read, the task is reusable.
+            log = _ChangeLog(conn)
             fresh = conn.execute(
-                "SELECT state FROM tasks WHERE task_id=?", (task_id,)).fetchone()
-            if fresh["state"] != REUSABLE:
-                log.record(task_id, fresh["state"], REUSABLE, None, None, 0)
+                "SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            state, reason, reason_task, depth = _decide(
+                _self_reason(fresh), _fetch_upstreams(conn, task_id))
+            if (state, reason, reason_task, depth) != (
+                    fresh["state"], fresh["reason"], fresh["reason_task_id"],
+                    fresh["depth"]):
+                log.record(task_id, fresh["state"], state, reason,
+                           reason_task, depth)
 
             # propagate the verdict to downstream tasks
             _propagate(conn, log, [task_id])

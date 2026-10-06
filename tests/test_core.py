@@ -293,6 +293,126 @@ def test_dynamic_deps_replaced_by_actual_reads():
     assert states(conn)["a"] == "executable"
 
 
+def plan_counts(conn):
+    return {state: n for state, n in core.plan_since(conn, 0)["counts"].items()
+            if n}
+
+
+def test_report_reading_unsettled_new_upstream_waits_not_reusable():
+    """A legitimate report may dynamically read an upstream that is itself
+    still executable.  The report is accepted, but the task must wait for
+    that upstream instead of turning reusable -- and downstream tasks whose
+    old inputs still match must not be released early."""
+    conn, _ = fresh_conn()
+    core.import_graph(conn, [
+        task("x", src_v=2, prev_src_v=1),   # x: sources changed -> executable
+        task("a", src_v=2, prev_src_v=1),   # a: sources changed -> executable
+        task("b", ["a"]),                   # b: read a's current artifact
+    ])
+    assert states(conn) == {"x": "executable", "a": "executable",
+                            "b": "waiting"}
+    claim_a, _ = core.claim(conn, "a")
+    # a dynamically reads x's *registered* artifact while x is not done yet;
+    # a reruns but produces the same artifact digest, so b's inputs all match
+    status, _ = core.report_result(
+        conn, "a", claim_a["input_fingerprint"],
+        [{"upstream": "x", "digest": "art:x"}], "art:a")
+    assert status == "accepted"
+    s = states(conn)
+    assert s["a"] == "waiting"      # x unsettled: a's fresh reads are provisional
+    assert s["b"] == "waiting"      # b must not be released early
+    row = conn.execute(
+        "SELECT reason, reason_task_id, depth FROM tasks WHERE task_id='a'"
+    ).fetchone()
+    assert row["reason"] == "upstream_waiting"
+    assert row["reason_task_id"] == "x"
+    assert row["depth"] == 1
+    row = conn.execute(
+        "SELECT reason, reason_task_id, depth FROM tasks WHERE task_id='b'"
+    ).fetchone()
+    assert row["reason"] == "upstream_waiting"
+    assert row["reason_task_id"] == "a"
+    assert row["depth"] == 2
+    # counts and change log agree with the stored states
+    assert plan_counts(conn) == {"executable": 1, "waiting": 2}
+    # chain b -> a -> x (root cause: x's sources changed)
+    chain = core.reason_chain(conn, "b")
+    assert [n["task_id"] for n in chain] == ["b", "a", "x"]
+    # x finishes with the SAME artifact digest -> a and b reusable again
+    claim_x, _ = core.claim(conn, "x")
+    status, _ = core.report_result(conn, "x", claim_x["input_fingerprint"],
+                                   [], "art:x")
+    assert status == "accepted"
+    assert states(conn) == {"x": "reusable", "a": "reusable", "b": "reusable"}
+    assert plan_counts(conn) == {"reusable": 3}
+
+
+def test_unsettled_upstream_completes_with_different_artifact():
+    """Same setup, but the new upstream finishes with a *different* artifact:
+    the task becomes executable (its recorded read is stale) and the
+    downstream keeps waiting."""
+    conn, _ = fresh_conn()
+    core.import_graph(conn, [
+        task("x", src_v=2, prev_src_v=1),
+        task("a", src_v=2, prev_src_v=1),
+        task("b", ["a"]),
+    ])
+    claim_a, _ = core.claim(conn, "a")
+    status, _ = core.report_result(
+        conn, "a", claim_a["input_fingerprint"],
+        [{"upstream": "x", "digest": "art:x"}], "art:a")
+    assert status == "accepted"
+    assert states(conn)["a"] == "waiting"
+    claim_x, _ = core.claim(conn, "x")
+    status, _ = core.report_result(conn, "x", claim_x["input_fingerprint"],
+                                   [], "art:x:v2")   # different digest
+    assert status == "accepted"
+    s = states(conn)
+    assert s["x"] == "reusable"
+    assert s["a"] == "executable"   # recorded read art:x is now stale
+    assert s["b"] == "waiting"      # a not settled
+    row = conn.execute(
+        "SELECT reason, reason_task_id, depth FROM tasks WHERE task_id='a'"
+    ).fetchone()
+    assert row["reason"] == "upstream_changed"
+    assert row["reason_task_id"] == "x"
+    assert row["depth"] == 1
+    assert plan_counts(conn) == {"reusable": 1, "executable": 1, "waiting": 1}
+    # a can be claimed again and completes against x's new artifact
+    claim_a2, err = core.claim(conn, "a")
+    assert err is None
+    status, _ = core.report_result(
+        conn, "a", claim_a2["input_fingerprint"],
+        [{"upstream": "x", "digest": "art:x:v2"}], "art:a")
+    assert status == "accepted"
+    assert states(conn) == {"x": "reusable", "a": "reusable", "b": "reusable"}
+
+
+def test_report_reading_waiting_upstream_propagates_depth():
+    """The new dynamic upstream may itself be waiting on something else;
+    the reason chain must point through it with the correct depth."""
+    conn, _ = fresh_conn()
+    core.import_graph(conn, [
+        task("root", src_v=2, prev_src_v=1),     # executable (depth 0)
+        task("mid", ["root"]),                   # waiting on root (depth 1)
+        task("a", src_v=2, prev_src_v=1),        # executable
+    ])
+    claim_a, _ = core.claim(conn, "a")
+    status, _ = core.report_result(
+        conn, "a", claim_a["input_fingerprint"],
+        [{"upstream": "mid", "digest": "art:mid"}], "art:a:NEW")
+    assert status == "accepted"
+    row = conn.execute(
+        "SELECT state, reason, reason_task_id, depth FROM tasks "
+        "WHERE task_id='a'").fetchone()
+    assert row["state"] == "waiting"
+    assert row["reason"] == "upstream_waiting"
+    assert row["reason_task_id"] == "mid"
+    assert row["depth"] == 2                     # through mid to root
+    chain = core.reason_chain(conn, "a")
+    assert [n["task_id"] for n in chain] == ["a", "mid", "root"]
+
+
 def test_restart_consistency():
     conn, path = fresh_conn()
     core.import_graph(conn, [
