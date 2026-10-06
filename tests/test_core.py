@@ -272,6 +272,140 @@ def test_missing_dependency_report_rolls_back():
     assert conn.execute("SELECT COUNT(*) FROM deps").fetchone()[0] == 0
 
 
+def test_report_with_unsettled_new_upstream_waits_then_recovers():
+    """A legitimate report whose reads discover a *new* dynamic upstream that
+    is itself still executable must be accepted (artifact + baseline saved)
+    but the task is adjudicated waiting -- not reusable -- and downstream
+    tasks whose old inputs still match must not be released early.  Once the
+    upstream settles with the same artifact digest, everything recovers."""
+    conn, _ = fresh_conn()
+    core.import_graph(conn, [
+        task("y", src_v=2, prev_src_v=1),   # y executable: sources changed
+        task("a", src_v=2, prev_src_v=1),   # a executable, no deps yet
+        task("b", ["a"]),                   # b waits on a (read art:a)
+    ])
+    plan0 = core.plan_since(conn, 0)
+
+    claim_a, err = core.claim(conn, "a")
+    assert err is None
+    # a runs and discovers it read y's currently registered artifact
+    status, _ = core.report_result(
+        conn, "a", claim_a["input_fingerprint"],
+        [{"upstream": "y", "digest": "art:y"}], "art:a")  # artifact unchanged
+    assert status == "accepted"
+
+    s = states(conn)
+    assert s["y"] == "executable"
+    assert s["a"] == "waiting"     # new upstream not settled: must wait
+    assert s["b"] == "waiting"     # old inputs match, but must not be released
+    row = conn.execute(
+        "SELECT reason, reason_task_id, depth FROM tasks "
+        "WHERE task_id='a'").fetchone()
+    assert (row["reason"], row["reason_task_id"], row["depth"]) == \
+        ("upstream_waiting", "y", 1)
+    # the dynamic dep and the run baseline were still persisted
+    dep = conn.execute(
+        "SELECT kind, read_digest FROM deps WHERE task_id='a'").fetchone()
+    assert (dep["kind"], dep["read_digest"]) == ("dynamic", "art:y")
+    row = conn.execute(
+        "SELECT prev_def_hash, def_hash, prev_source_digest, source_digest "
+        "FROM tasks WHERE task_id='a'").fetchone()
+    assert row["prev_def_hash"] == row["def_hash"]
+    assert row["prev_source_digest"] == row["source_digest"]
+    # change log, counts and chain agree: a and b changed, y did not
+    plan1 = core.plan_since(conn, plan0["seq"])
+    assert {c["task_id"] for c in plan1["changes"]} == {"a", "b"}
+    assert plan1["counts"]["executable"] == 1
+    assert plan1["counts"]["waiting"] == 2
+    assert [n["task_id"] for n in core.reason_chain(conn, "b")] == \
+        ["b", "a", "y"]
+
+    # re-reporting with the old claim fingerprint is stale, side-effect free
+    before_seq = conn.execute("SELECT MAX(seq) FROM changes").fetchone()[0]
+    status, _ = core.report_result(
+        conn, "a", claim_a["input_fingerprint"],
+        [{"upstream": "y", "digest": "art:y"}], "art:a")
+    assert status == "stale"
+    assert conn.execute("SELECT MAX(seq) FROM changes").fetchone()[0] \
+        == before_seq
+    assert states(conn)["a"] == "waiting"
+
+    # y settles with the same artifact a read -> a and b reusable again
+    claim_y, _ = core.claim(conn, "y")
+    status, _ = core.report_result(
+        conn, "y", claim_y["input_fingerprint"], [], "art:y")
+    assert status == "accepted"
+    assert states(conn) == {"y": "reusable", "a": "reusable", "b": "reusable"}
+    plan2 = core.plan_since(conn, plan1["seq"])
+    assert {c["task_id"] for c in plan2["changes"]} == {"y", "a", "b"}
+    assert plan2["counts"]["reusable"] == 3
+
+
+def test_unsettled_new_upstream_completes_with_different_artifact():
+    """Same discovery, but the new upstream reruns to a *different* artifact:
+    this task becomes executable (its recorded read is stale) and the
+    downstream keeps waiting."""
+    conn, _ = fresh_conn()
+    core.import_graph(conn, [
+        task("y", src_v=2, prev_src_v=1),
+        task("a", src_v=2, prev_src_v=1),
+        task("b", ["a"]),
+    ])
+    claim_a, _ = core.claim(conn, "a")
+    status, _ = core.report_result(
+        conn, "a", claim_a["input_fingerprint"],
+        [{"upstream": "y", "digest": "art:y"}], "art:a:NEW")
+    assert status == "accepted"
+    assert states(conn)["a"] == "waiting"
+    # the accepted artifact was saved even though the task is not reusable
+    assert conn.execute(
+        "SELECT artifact_digest FROM tasks WHERE task_id='a'").fetchone()[0] \
+        == "art:a:NEW"
+
+    claim_y, _ = core.claim(conn, "y")
+    core.report_result(conn, "y", claim_y["input_fingerprint"], [], "art:y:v2")
+    s = states(conn)
+    assert s["y"] == "reusable"
+    assert s["a"] == "executable"   # recorded read digest no longer matches
+    assert s["b"] == "waiting"
+    row = conn.execute(
+        "SELECT reason, reason_task_id, depth FROM tasks "
+        "WHERE task_id='a'").fetchone()
+    assert (row["reason"], row["reason_task_id"], row["depth"]) == \
+        ("upstream_changed", "y", 1)
+    assert [n["task_id"] for n in core.reason_chain(conn, "b")] == \
+        ["b", "a", "y"]
+
+
+def test_report_with_waiting_new_upstream_waits():
+    """The newly discovered upstream may itself be waiting on its own
+    upstreams; the reporting task waits behind it transitively."""
+    conn, _ = fresh_conn()
+    core.import_graph(conn, [
+        task("z", src_v=2, prev_src_v=1),   # z executable
+        task("y", ["z"]),                   # y waiting on z
+        task("a", src_v=2, prev_src_v=1),   # a executable, no deps yet
+    ])
+    claim_a, _ = core.claim(conn, "a")
+    status, _ = core.report_result(
+        conn, "a", claim_a["input_fingerprint"],
+        [{"upstream": "y", "digest": "art:y"}], "art:a")
+    assert status == "accepted"
+    s = states(conn)
+    assert s["a"] == "waiting"
+    row = conn.execute(
+        "SELECT reason, reason_task_id, depth FROM tasks "
+        "WHERE task_id='a'").fetchone()
+    assert (row["reason"], row["reason_task_id"], row["depth"]) == \
+        ("upstream_waiting", "y", 2)   # a -> y -> z
+
+    # z settles with the artifact y read; y never reran but is now settled,
+    # so a recovers through the chain
+    claim_z, _ = core.claim(conn, "z")
+    core.report_result(conn, "z", claim_z["input_fingerprint"], [], "art:z")
+    assert states(conn) == {"z": "reusable", "y": "reusable", "a": "reusable"}
+
+
 def test_dynamic_deps_replaced_by_actual_reads():
     conn, _ = fresh_conn()
     core.import_graph(conn, [

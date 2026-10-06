@@ -332,9 +332,9 @@ def report_result(conn, task_id, fingerprint, reads, artifact_digest):
     it actually read:
 
     * the task must currently be ``executable`` -- a re-report after the task
-      was already completed is a duplicate and is refused as ``stale`` (a first
-      report marks the task reusable without changing the fingerprint, which is
-      exactly what previously let an old fingerprint overwrite the plan);
+      was already reported on is a duplicate and is refused as ``stale`` (an
+      accepted report leaves the claim fingerprint valid, which is exactly
+      what previously let an old fingerprint overwrite the plan);
     * the claim fingerprint must still equal the fingerprint of the current
       definition, source digest and registered upstream artifacts;
     * every read must reference an existing upstream task
@@ -347,6 +347,16 @@ def report_result(conn, task_id, fingerprint, reads, artifact_digest):
     ``read_digest`` is updated on the static row instead of being inserted a
     second time as a dynamic row (which would hit the primary key).  The
     dynamic set is replaced wholesale by the reads that are not static keys.
+
+    The accepted artifact and the historical input baseline (definition,
+    source and per-upstream read digests) are saved in the same transaction,
+    but the task is *not* blindly marked reusable: it is re-adjudicated
+    against the dependency rows just registered.  A newly discovered upstream
+    that is itself still waiting or executable keeps this task ``waiting``
+    (and its downstream waiting too) even though the digest read matches that
+    upstream's currently registered artifact -- the upstream may yet rerun
+    and produce a different one.  Once the upstream settles, propagation
+    flips this task reusable (same artifact) or executable (artifact moved).
 
     Returns ``(status, detail)`` where status is "accepted", "stale" or one of
     the error codes.  Every failure rolls the whole report back, so tasks,
@@ -438,16 +448,24 @@ def report_result(conn, task_id, fingerprint, reads, artifact_digest):
                 conn.rollback()
                 return "cycle", {"task_id": task_id}
 
-            # the task itself is now up to date with what it read
+            # the accepted artifact and this run's input baseline are saved;
+            # the task is then re-adjudicated against the deps it just
+            # registered -- a new upstream that has not settled yet keeps the
+            # task waiting instead of prematurely reusable
             log = _ChangeLog(conn)
             conn.execute(
                 "UPDATE tasks SET artifact_digest=?, prev_def_hash=def_hash, "
                 "                prev_source_digest=source_digest "
                 "WHERE task_id=?", (artifact_digest, task_id))
             fresh = conn.execute(
-                "SELECT state FROM tasks WHERE task_id=?", (task_id,)).fetchone()
-            if fresh["state"] != REUSABLE:
-                log.record(task_id, fresh["state"], REUSABLE, None, None, 0)
+                "SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            state, reason, reason_task, depth = _decide(
+                _self_reason(fresh), _fetch_upstreams(conn, task_id))
+            if (state, reason, reason_task, depth) != (
+                    fresh["state"], fresh["reason"], fresh["reason_task_id"],
+                    fresh["depth"]):
+                log.record(task_id, fresh["state"], state, reason,
+                           reason_task, depth)
 
             # propagate the verdict to downstream tasks
             _propagate(conn, log, [task_id])
